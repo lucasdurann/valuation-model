@@ -65,6 +65,8 @@ def get_financials(ticker: str) -> dict[str, pd.DataFrame]:
 # --------------------------------------------------------------------------- #
 # 3 · Helper calculations
 # --------------------------------------------------------------------------- #
+
+# Utility function to pick a row from a DataFrame based on exact labels or keywords.
 def pick_row(
     df: pd.DataFrame,
     aliases: Sequence[str] | None = None,
