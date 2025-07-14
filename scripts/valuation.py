@@ -10,6 +10,7 @@ Author: Lucas Duran
 
 from pathlib import Path
 import os
+import sys
 
 import pandas as pd
 import yfinance as yf
@@ -35,31 +36,38 @@ FRED_KEY = os.getenv("FRED_API_KEY")       # <- make sure .env contains this
 # --------------------------------------------------------------------------- #
 def get_financials(ticker: str) -> dict[str, pd.DataFrame]:
     """
-    Pull the most recent annual & trailing-twelve-month financial statements
-    from Yahoo Finance.
-
-    Returns
-    -------
-    dict
-        {
-            "income_stmt": DataFrame,
-            "balance_sheet": DataFrame,
-            "cashflow": DataFrame
-        }
+    Return a dict of cleaned DataFrames:
+        income_stmt, balance_sheet, cashflow
     """
     tkr = yf.Ticker(ticker)
 
-    fin_dict = {
-        "income_stmt": tkr.income_stmt,
-        "balance_sheet": tkr.balance_sheet,
-        "cashflow": tkr.cashflow,
+    # ---------- helper 1: clean annual tables ----------
+    def _clean(df: pd.DataFrame) -> pd.DataFrame:
+        df = df.copy()
+        df.index = (df.index.astype(str)
+                              .str.strip()
+                              .str.lower()
+                              .str.replace(r"\s+", " ", regex=True))
+        df = df.iloc[:, :5]                       # keep latest 5 cols
+        parsed = pd.to_datetime(df.columns, errors="coerce")
+        df.columns = [
+        str(ts.year) if not pd.isna(ts) else str(orig)
+        for orig, ts in zip(df.columns, parsed)
+        ]
+        return df.astype(float)
+
+    # ---------- fetch three annual statements ----------
+    fin = {
+        "income_stmt":   _clean(tkr.income_stmt),
+        "balance_sheet": _clean(tkr.balance_sheet),
+        "cashflow":      _clean(tkr.cashflow),
     }
 
-    # Optionally dump raw CSVs for inspection
-    for name, df in fin_dict.items():
-        df.to_csv(DATA_DIR / f"{ticker}_{name}.csv")
+    # Optional cache for debugging
+    for name, df in fin.items():
+        (DATA_DIR / f"{ticker}_{name}.csv").write_text(df.to_csv())
 
-    return fin_dict
+    return fin
 
 
 # --------------------------------------------------------------------------- #
@@ -104,6 +112,51 @@ def pick_row(
         f"No row found. Tried aliases={aliases} and keywords={must_contain}"
     )
 
+# Tidy up the financial statements into a single DataFrame.
+def tidy_statements(fin: dict) -> pd.DataFrame:
+    rows = [
+        pick_row(fin["income_stmt"],
+             aliases=["total revenue", "operating revenue"],
+             must_contain="revenue").rename("revenue"),
+        pick_row(fin["income_stmt"],
+             aliases=["ebit", "operating income"],
+             must_contain="operating income|ebit").rename("ebit"),
+        pick_row(fin["income_stmt"],
+             aliases=["income tax expense", "tax provision"],
+             must_contain="tax").rename("tax"),
+        pick_row(fin["cashflow"],
+             aliases=["depreciation & amortization", "depreciation"],
+             must_contain="depreci").rename("dep_amort"),
+        pick_row(fin["cashflow"],
+             aliases=["capital expenditure", "capital expenditures"],
+             must_contain="capital expend").rename("capex"),
+        pick_row(fin["balance_sheet"],
+             aliases=["total assets"],
+             must_contain="total assets").rename("assets"),
+        pick_row(fin["balance_sheet"],
+             aliases=["total debt"],
+             must_contain="total debt").rename("debt"),
+        pick_row(fin["balance_sheet"],
+             aliases=["cash", "cash and cash equivalents"],
+             must_contain="cash").rename("cash"),
+        pick_row(fin["balance_sheet"],
+             aliases=["accounts receivable"],
+             must_contain="accounts rec").rename("ar"),
+        pick_row(fin["balance_sheet"],
+             aliases=["inventory"],
+             must_contain="inventory").rename("inventory"),
+        pick_row(fin["balance_sheet"],
+             aliases=["accounts payable"],
+             must_contain="accounts pay").rename("ap"),
+    ]
+    tidy = pd.concat(rows, axis=1).T
+    # move TTM to right-most column if not already
+    if "ttm" in tidy.columns:
+        cols = [c for c in tidy.columns if c != "ttm"] + ["ttm"]
+        tidy = tidy[cols]
+    return tidy
+
+
 def calc_historical_fcff(statements: dict[str, pd.DataFrame]) -> pd.DataFrame:
     """
     Compute historical Free Cash-Flow to the Firm (FCFF).
@@ -115,19 +168,24 @@ def calc_historical_fcff(statements: dict[str, pd.DataFrame]) -> pd.DataFrame:
     cf = statements["cashflow"]
 
     # -------------- core line items -------------- #
-    nopat = income.loc["EBIT"] * (1 - 0.21)          # assume 21 % tax for now
+    nopat = pick_row(income, aliases=["ebit"]).astype(float) * (1 - 0.21)          # assume 21 % tax for now
     dep_amort = pick_row(cf, aliases=["Depreciation & Amortization", "Depreciation & amortization",],   # exact match
-                          must_contain=["Depreciation"])          # any label containing this
+                          must_contain=["Depreciation"])   # any label containing this
     capex = -pick_row(cf, aliases=["Capital Expenditure", "Capital Expenditures"],    # Yahoo returns negative
-                      must_contain=["capital", "expend"]) 
+                      must_contain=["capital", "expend"])
 
     # Net working-capital components
     nwc = (
-        bal.loc["Accounts Receivable"]
-        + bal.loc["Inventory"]
-        - bal.loc["Accounts Payable"]
-    )
-    delta_nwc = nwc.diff(periods=-1).fillna(0)  # year-over-year change
+        bal.loc["accounts receivable"]
+      + bal.loc["inventory"]
+      - bal.loc["accounts payable"]
+   )
+    # compute ΔNWC and *ensure* a zero for "ttm" by reindexing to nopat.index
+    delta_nwc = (
+               nwc.diff(periods=-1)     # year-over-year change
+               .fillna(0)            # fill missing annual change
+               .reindex(nopat.index, fill_value=0)
+   )
 
     fcff = nopat + dep_amort - capex - delta_nwc
     fcff_df = fcff.to_frame(name="FCFF").T     # nicer shape (years as columns)
@@ -170,13 +228,26 @@ def forecast_fcff(
     """
     raise NotImplementedError("Forecasting routine not yet implemented.")
 
+def dump_to_excel(ticker: str, tidy: pd.DataFrame):
+    xl_path = PROJECT_ROOT / "templates" / "DCF_Model.xlsx"
+    with pd.ExcelWriter(xl_path, engine="openpyxl",
+                        mode="a", if_sheet_exists="replace") as w:
+        tidy.to_excel(w,
+                      sheet_name="Raw_FS",
+                      startrow=0, startcol=0,  # B2
+                      header=True, index=True)
+    print(f"✅  Raw_FS updated for {ticker} → {xl_path.name}")
 
 # --------------------------------------------------------------------------- #
 # 5 · Main script hook – quick sanity test
 # --------------------------------------------------------------------------- #
 def main(ticker: str = "AAPL"):
+    if len(sys.argv) > 1:
+        ticker = sys.argv[1]
     print(f"Pulling financials for {ticker} …")
     fin = get_financials(ticker)
+    tidy = tidy_statements(fin)
+    dump_to_excel(ticker, tidy)
     print("Income-statement shape:", fin["income_stmt"].shape)
 
     fcff_hist = calc_historical_fcff(fin)
