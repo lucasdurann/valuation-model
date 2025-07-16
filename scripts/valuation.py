@@ -148,6 +148,9 @@ def tidy_statements(fin: dict) -> pd.DataFrame:
         pick_row(fin["balance_sheet"],
              aliases=["accounts payable"],
              must_contain="accounts pay").rename("ap"),
+        pick_row(fin["income_stmt"],
+             aliases=["interest expense", "interest"],
+             must_contain="interest").rename("interest"),
     ]
     tidy = pd.concat(rows, axis=1).T
     # move TTM to right-most column if not already
